@@ -1,0 +1,53 @@
+name: Build Wails Extension for macOS
+
+# Trigger the workflow on push to the main branch or on pull requests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-macos:
+    runs-on: macos-latest  # Use the latest macOS runner provided by GitHub
+    steps:
+      # Checkout the repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # Include submodules if your project uses them
+
+      # Set up Go (Wails requires a specific Go version)
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.1'  # Use the Go version compatible with Wails v2 (adjust if needed)
+
+      # Install Node.js (required for Wails frontend build)
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'  # Use a stable Node.js version (adjust if needed)
+
+      # Install Wails CLI
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      # Install project dependencies
+      - name: Install dependencies
+        run: |
+          npm install  # Install frontend dependencies
+          go mod tidy  # Ensure Go dependencies are up-to-date
+
+      # Build the Wails application for macOS
+      - name: Build for macOS
+        run: wails build -platform darwin/universal  # Builds a universal binary for macOS (Intel + ARM)
+
+      # Optional: Upload the built artifact for download
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-extension
+          path: build/bin/*.app  # Path to the built macOS app bundle
