@@ -1,13 +1,13 @@
-name: Build Wails Extension for macOS
+name: Build GambaSuite for macOS
 
 # Trigger the workflow on push to the main branch or on pull requests
 on:
   push:
     branches:
-      - main
+      - dev
   pull_request:
     branches:
-      - main
+      - dev
 
 jobs:
   build-macos:
