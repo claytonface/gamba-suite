@@ -3,6 +3,7 @@ package main
 import (
 	"embed"
 	"log"
+	"strings"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -16,12 +17,12 @@ var assets embed.FS
 var ext = g.NewExt(g.ExtInfo{
 	Title:       "[AIO] Gamba Suite",
 	Description: "Pkr, 13/21 and Tri dice automated rolling and resetting with in-chat hand evaluation. The all-in-one dice management plugin.",
-	Version:     "2.0.1",
+	Version:     "2.1.0",
 	Author:      "JTD",
 })
 
 var (
-	CurrentVersion = "2.0.1"
+	CurrentVersion = "2.1.0"
 )
 
 var app *App
@@ -72,7 +73,19 @@ func setupExt() {
 	ext.Connected(func(e g.ConnectArgs) {
 		log.Printf("connected (%s:%d)", e.Host, e.Port)
 		log.Printf("client %s (%s)", e.Client.Identifier, e.Client.Version)
+
+		clientIdentifier := e.Client.Identifier
+		flashDetected := strings.Contains(strings.ToUpper(clientIdentifier), "FLASH")
+		isFlash = &flashDetected // Set the global flag
+		log.Printf("Is Flash: %v", *isFlash)
 	})
+
+	// ext.Connected(func(e g.ConnectArgs) {
+	// 	log.Printf("connected (%s:%d)", e.Host, e.Port)
+	// 	log.Printf("client %s (%s)", e.Client.Identifier, e.Client.Version)
+	// 	clientIdentifier := e.Client.Identifier
+	// 	isFlash = strings.Contains(strings.ToUpper(clientIdentifier), "FLASH")
+	// })
 
 	ext.Disconnected(func() {
 		log.Printf("connection lost")

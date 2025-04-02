@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	legacyOut "xabbo.b7c.io/goearth/out"
 	"xabbo.b7c.io/goearth/shockwave/out"
 )
 
@@ -16,7 +17,11 @@ import (
 func sendMessageWithDelay(message string) {
 	// sleep random between 250 and 500ms
 	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-	ext.Send(out.SHOUT, message)
+	if isFlash != nil && *isFlash { // Flash (Legacy) client handling
+		ext.Send(legacyOut.Shout, message, 0, 1)
+	} else { // Shockwave (Origins) client handling
+		ext.Send(out.SHOUT, message)
+	}
 	log.Printf("Sent message: %s", message)
 }
 
@@ -147,18 +152,62 @@ func (a *App) evaluate13Hand() {
 	is13Hitting = false
 }
 
+// // Wait for all dice results and evaluate the tri hand
+// func (a *App) evaluateTriHand() {
+// 	if !ChatIsDisabled {
+// 		hand := sumHand([]int{
+// 			diceList[0].Value,
+// 			diceList[2].Value,
+// 			diceList[4].Value,
+// 		})
+// 		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
+// 		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+// 		a.AddLogMsg(logRollResult)
+
+// 		if !isMuted {
+// 			// If the user is not muted, send the message
+// 			sendMessageWithDelay(hand)
+// 		} else {
+// 			// If the user is muted, queue the message to send later
+// 			log.Printf("User is muted. Queuing message: %s", hand)
+// 			// ToDo:
+// 			// messageQueue = append(messageQueue, hand)
+// 		}
+// 	} else {
+// 		hand := sumHand([]int{
+// 			diceList[0].Value,
+// 			diceList[2].Value,
+// 			diceList[4].Value,
+// 		})
+// 		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
+// 		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+// 		a.AddLogMsg(logRollResult)
+// 	}
+// 	isTriRolling = false
+// }
+
 // Wait for all dice results and evaluate the tri hand
 func (a *App) evaluateTriHand() {
-	if !ChatIsDisabled {
-		hand := sumHand([]int{
+	var hand string
+	if isFlash != nil && *isFlash { // Flash client
+		hand = sumHand([]int{
+			diceList[0].Value,
+			diceList[1].Value,
+			diceList[2].Value,
+		})
+	} else { // Shockwave (Origins) client
+		hand = sumHand([]int{
 			diceList[0].Value,
 			diceList[2].Value,
 			diceList[4].Value,
 		})
-		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
+	}
 
+	logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
+	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+	a.AddLogMsg(logRollResult)
+
+	if !ChatIsDisabled {
 		if !isMuted {
 			// If the user is not muted, send the message
 			sendMessageWithDelay(hand)
@@ -168,16 +217,8 @@ func (a *App) evaluateTriHand() {
 			// ToDo:
 			// messageQueue = append(messageQueue, hand)
 		}
-	} else {
-		hand := sumHand([]int{
-			diceList[0].Value,
-			diceList[2].Value,
-			diceList[4].Value,
-		})
-		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
 	}
+
 	isTriRolling = false
 }
 
@@ -285,6 +326,111 @@ func (a *App) toPokerString(dices []*Dice) string {
 		}
 
 		// Construct the string with the three-of-a-kind first
+		n = strconv.Itoa(threeOfAKind) + strconv.Itoa(pair)
+		return fmt.Sprintf(config.FullHouse, n)
+	case "22":
+		return fmt.Sprintf(config.TwoPair, n)
+	case "2":
+		return fmt.Sprintf(config.OnePair, n)
+	default:
+		return n + ""
+	}
+}
+
+func (a *App) evaluatePokerHandFlash(flashDiceResults []int) {
+	if !ChatIsDisabled {
+		hand := a.toPokerStringFlash(flashDiceResults)
+		logRollResult := fmt.Sprintf("Poker Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+		a.AddLogMsg(logRollResult)
+
+		if !isMuted {
+			sendMessageWithDelay(hand)
+		} else {
+			log.Printf("User is muted. Queuing message: %s", hand)
+		}
+	} else {
+		hand := a.toPokerStringFlash(flashDiceResults)
+		logRollResult := fmt.Sprintf("Poker Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+		a.AddLogMsg(logRollResult)
+	}
+}
+
+func (a *App) toPokerStringFlash(diceValues []int) string {
+	// Load user configuration
+	config := a.LoadConfig()
+
+	if config == nil {
+		config = &PokerDisplayConfig{
+			FiveOfAKind:  "Five of a kind: %s",
+			FourOfAKind:  "Four of a kind: %s",
+			FullHouse:    "Full House: %s",
+			HighStraight: "High Str8",
+			LowStraight:  "Low Str8",
+			ThreeOfAKind: "Three of a kind: %s",
+			TwoPair:      "Two Pair: %ss",
+			OnePair:      "One Pair: %ss",
+			Nothing:      "Nothing",
+		}
+	}
+
+	// Convert to sorted string representation
+	sort.Ints(diceValues)
+	s := ""
+	for _, value := range diceValues {
+		s += strconv.Itoa(value)
+	}
+
+	// Check for straights
+	if s == "12345" {
+		return fmt.Sprintf(config.LowStraight)
+	}
+	if s == "23456" {
+		return fmt.Sprintf(config.HighStraight)
+	}
+
+	// Count occurrences
+	mapCount := make(map[int]int)
+	for _, c := range s {
+		mapCount[int(c-'0')]++
+	}
+
+	keys := []int{}
+	values := []int{}
+	for k, v := range mapCount {
+		if v > 1 {
+			keys = append(keys, k)
+			values = append(values, v)
+		}
+	}
+
+	if len(keys) == 0 {
+		return fmt.Sprintf(config.Nothing)
+	}
+
+	sort.Slice(keys, func(i, j int) bool { return keys[i] > keys[j] })
+	sort.Slice(values, func(i, j int) bool { return values[i] > values[j] })
+
+	n := strings.Trim(strings.Replace(fmt.Sprint(keys), " ", "", -1), "[]")
+	c := strings.Trim(strings.Replace(fmt.Sprint(values), " ", "", -1), "[]")
+
+	switch c {
+	case "5":
+		return fmt.Sprintf(config.FiveOfAKind, n)
+	case "4":
+		return fmt.Sprintf(config.FourOfAKind, n)
+	case "3":
+		return fmt.Sprintf(config.ThreeOfAKind, n)
+	case "32":
+		var threeOfAKind, pair int
+		for num, count := range mapCount {
+			if count == 3 {
+				threeOfAKind = num
+			} else if count == 2 {
+				pair = num
+			}
+		}
 		n = strconv.Itoa(threeOfAKind) + strconv.Itoa(pair)
 		return fmt.Sprintf(config.FullHouse, n)
 	case "22":

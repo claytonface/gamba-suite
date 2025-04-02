@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,6 +20,10 @@ import (
 	g "xabbo.b7c.io/goearth"
 	"xabbo.b7c.io/goearth/shockwave/in"
 	"xabbo.b7c.io/goearth/shockwave/out"
+
+	// Flash (Legacy) version
+	legacyIn "xabbo.b7c.io/goearth/in"
+	legacyOut "xabbo.b7c.io/goearth/out"
 )
 
 // Global variables for dice management, rolling state, mutex, and wait group
@@ -27,7 +32,6 @@ var (
 	mutedDuration    int
 	isMuted          bool
 	currentSum       int
-	commandList      string
 	isPokerRolling   bool
 	isTriRolling     bool
 	isBJRolling      bool
@@ -39,6 +43,7 @@ var (
 	mutex            sync.Mutex
 	resultsWaitGroup sync.WaitGroup
 	rollDelay        = 550 * time.Millisecond
+	isFlash          *bool // Flag to check if user is running Origins or Legacy (.com)
 )
 
 type App struct {
@@ -132,15 +137,31 @@ func getConfigFilePath() string {
 }
 
 func (a *App) setupExt() {
-	a.ext.Intercept(out.CHAT, out.SHOUT, out.WHISPER).With(a.onChatMessage)
-	a.ext.Intercept(out.THROW_DICE).With(a.handleThrowDice)
-	a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
-	a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
-	a.ext.Intercept(out.CHAT).With(a.handleTalk)
-	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
-	a.ext.InterceptAll(func(e *g.Intercept) {
-		handleMutePacket(e)
-	})
+	go func() { // Run in a separate goroutine
+		for isFlash == nil { // Wait until isFlash is set
+			time.Sleep(100 * time.Millisecond) // Small delay to prevent CPU overuse
+		}
+		if isFlash != nil && !*isFlash {
+			log.Printf("Detected Origins: %v", *isFlash)
+			a.ext.Intercept(out.CHAT, out.SHOUT, out.WHISPER).With(a.onChatMessage)
+			a.ext.Intercept(out.THROW_DICE).With(a.handleThrowDice)
+			a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
+			a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
+			a.ext.Intercept(out.CHAT).With(a.handleTalk)
+			a.ext.Intercept(out.SHOUT).With(a.handleTalk)
+			a.ext.InterceptAll(func(e *g.Intercept) {
+				handleMutePacket(e)
+			})
+		} else {
+			log.Printf("Detected Flash: %v", *isFlash)
+			a.ext.Intercept(legacyOut.Chat, legacyOut.Shout, legacyOut.Whisper).With(a.onChatMessage)
+			a.ext.Intercept(legacyOut.ThrowDice).With(a.handleThrowDice)
+			a.ext.Intercept(legacyOut.DiceOff).With(a.handleDiceOff)
+			a.ext.Intercept(legacyIn.DiceValue).With(a.handleDiceResult)
+			a.ext.Intercept(legacyOut.Chat).With(a.handleTalk)
+			a.ext.Intercept(legacyOut.Shout).With(a.handleTalk)
+		}
+	}()
 }
 
 func (a *App) runExt() {
@@ -214,13 +235,17 @@ func (a *App) onChatMessage(e *g.Intercept) {
 		case strings.HasSuffix(command, "roll"):
 			e.Block()
 			isPokerRolling = true
-			logRollResult := fmt.Sprintf("Poker Roll:\n")
+			logRollResult := fmt.Sprintln("Poker Roll:")
 			a.AddLogMsg(logRollResult)
-			go a.rollPokerDice()
+			if isFlash != nil && !*isFlash { // If it's Origins
+				go a.rollPokerDice()
+			} else {
+				go a.rollPokerDiceFlash()
+			}
 		case strings.HasSuffix(command, "tri"):
 			e.Block()
 			isTriRolling = true
-			logRollResult := fmt.Sprint("Tri Roll:\n")
+			logRollResult := fmt.Sprintln("Tri Roll:")
 			a.AddLogMsg(logRollResult)
 			go a.rollTriDice()
 		case strings.HasSuffix(command, "close"):
@@ -229,13 +254,13 @@ func (a *App) onChatMessage(e *g.Intercept) {
 		case strings.HasSuffix(command, "21"):
 			e.Block()
 			isBJRolling = true
-			logRollResult := fmt.Sprintf("21 Roll:\n")
+			logRollResult := fmt.Sprintln("21 Roll:")
 			a.AddLogMsg(logRollResult)
 			go a.rollBjDice()
 		case strings.HasSuffix(command, "13"):
 			e.Block()
 			is13Rolling = true
-			logRollResult := fmt.Sprintf("13 Roll:\n")
+			logRollResult := fmt.Sprintln("13 Roll:")
 			a.AddLogMsg(logRollResult)
 			go a.roll13Dice()
 		case strings.HasPrefix(command, "@"):
@@ -277,16 +302,37 @@ func resetDiceState() {
 
 func (a *App) handleThrowDice(e *g.Intercept) {
 	packet := e.Packet
-	rawData := string(packet.Data)
-	logrus.WithFields(logrus.Fields{"raw_data": rawData}).Debug("Raw packet data")
 
-	diceData := strings.Fields(rawData)
-	diceIDStr := diceData[0]
-	diceID, err := strconv.Atoi(diceIDStr)
-	if err != nil {
-		logrus.WithFields(logrus.Fields{"dice_id_str": diceIDStr, "error": err}).Warn("Failed to parse dice ID")
-		return
+	var diceID int
+	var err error
+
+	if isFlash != nil && *isFlash { // Flash (Legacy) client handling
+		// Flash uses binary data, so we need to extract the integer correctly.
+		if len(packet.Data) >= 4 { // Ensure at least 4 bytes are available
+			diceID = int(binary.BigEndian.Uint32(packet.Data[len(packet.Data)-4:])) // Extract last 4 bytes as int
+		} else {
+			log.Println("Invalid Flash packet format:", packet.Data)
+			return
+		}
+	} else { // Origins (Shockwave) client handling
+		rawData := string(packet.Data)
+		log.Println("RawData:", rawData)
+
+		diceData := strings.Fields(rawData)
+		if len(diceData) == 0 {
+			log.Println("Invalid Origins packet format")
+			return
+		}
+
+		diceIDStr := diceData[0]
+		diceID, err = strconv.Atoi(diceIDStr)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{"dice_id_str": diceIDStr, "error": err}).Warn("Failed to parse dice ID")
+			return
+		}
 	}
+
+	log.Printf("Parsed Dice ID: %d", diceID)
 
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -300,15 +346,29 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 		}
 	}
 
-	// If not found and the list has fewer than 5 dice, create and add a new one
-	if existingDice == nil && len(diceList) < 5 {
-		newDice := &Dice{ID: diceID, IsRolling: true, IsClosed: false}
-		diceList = append(diceList, newDice)
-		log.Printf("Dice %d added\n", diceID)
+	if !*isFlash {
+		// Origins allows up to 5 dice
+		if existingDice == nil && len(diceList) < 5 {
+			newDice := &Dice{ID: diceID, IsRolling: true, IsClosed: false}
+			diceList = append(diceList, newDice)
+			log.Printf("Dice %d added\n", diceID)
 
-		if len(diceList) == 5 {
-			message := "Dice setup sucessful! Run :roll to confirm"
-			a.AddLogMsg(message)
+			if len(diceList) == 5 {
+				message := "Dice setup successful! Run :roll to confirm"
+				a.AddLogMsg(message)
+			}
+		}
+	} else {
+		// Flash allows only 3 dice
+		if existingDice == nil && len(diceList) < 3 {
+			newDice := &Dice{ID: diceID, IsRolling: true, IsClosed: false}
+			diceList = append(diceList, newDice)
+			log.Printf("Dice %d added\n", diceID)
+
+			if len(diceList) == 3 {
+				message := "Dice setup successful! Run :roll to confirm"
+				a.AddLogMsg(message)
+			}
 		}
 	}
 }
@@ -316,16 +376,30 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 // handle the turning off of a dice
 func (a *App) handleDiceOff(e *g.Intercept) {
 	packet := e.Packet
-	diceIDStr := string(packet.Data)
+	var diceID int
+	var err error
 
-	diceID, err := strconv.Atoi(diceIDStr)
-	if err != nil {
-		logrus.WithFields(logrus.Fields{
-			"dice_id_str": diceIDStr,
-			"error":       err,
-		}).Warn("Failed to parse dice ID")
-		return
+	if isFlash != nil && *isFlash { // Flash (Legacy) client handling
+		// Flash uses raw binary data, extract the dice ID (first 4 bytes)
+		if len(packet.Data) >= 4 { // Ensure there are at least 4 bytes
+			diceID = int(binary.BigEndian.Uint32(packet.Data[:4])) // Extract first 4 bytes as an integer
+		} else {
+			log.Println("Invalid Flash packet format:", packet.Data)
+			return
+		}
+	} else { // Origins (Shockwave) client handling
+		diceIDStr := string(packet.Data)
+		diceID, err = strconv.Atoi(diceIDStr)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"dice_id_str": diceIDStr,
+				"error":       err,
+			}).Warn("Failed to parse dice ID")
+			return
+		}
 	}
+
+	log.Printf("Parsed Dice ID (isFlash: %v): %d", isFlash, diceID)
 
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -339,8 +413,13 @@ func (a *App) handleDiceOff(e *g.Intercept) {
 		}
 	}
 
-	// If not found and the list has fewer than 5 dice, create and add a new one
-	if existingDice == nil && len(diceList) < 5 {
+	// If not found, add a new dice entry
+	maxDice := 5
+	if isFlash != nil && *isFlash {
+		maxDice = 3 // Flash clients use up to 3 dice
+	}
+
+	if existingDice == nil && len(diceList) < maxDice {
 		newDice := &Dice{ID: diceID, IsRolling: false, IsClosed: true}
 		diceList = append(diceList, newDice)
 		log.Printf("Dice %d added\n", diceID)
@@ -350,29 +429,64 @@ func (a *App) handleDiceOff(e *g.Intercept) {
 // Handle the result of a dice roll
 func (a *App) handleDiceResult(e *g.Intercept) {
 	packet := e.Packet
-	rawData := string(packet.Data)
-	logrus.WithFields(logrus.Fields{"raw_data": rawData}).Debug("Raw packet data")
+	logrus.WithFields(logrus.Fields{"packet_data": packet.Data}).Debug("Packet data received")
 
-	diceData := strings.Fields(rawData)
-	if len(diceData) < 2 {
-		return
+	var diceID int
+	var diceValue int
+	var err error
+
+	if isFlash != nil && *isFlash { // Flash (Legacy) client handling
+		// Flash uses raw binary data, extract diceID (first 4 bytes) and diceValue (last byte)
+		if len(packet.Data) >= 5 { // Ensure at least 5 bytes: 4 for ID, 1 for value
+			diceID = int(binary.BigEndian.Uint32(packet.Data[:4])) // Extract first 4 bytes for dice ID
+			diceValue = int(packet.Data[len(packet.Data)-1])       // Extract the last byte for dice value
+
+			// Ignore rolling state placeholder (255)
+			if diceValue == 255 || diceValue == 100 {
+				log.Printf("Dice %d is still rolling...", diceID)
+				return
+			}
+		} else {
+			log.Println("Invalid Flash packet format:", packet.Data)
+			return
+		}
+	} else { // Shockwave (Origins) client handling
+		rawData := string(packet.Data)
+		logrus.WithFields(logrus.Fields{"raw_data": rawData}).Debug("Raw packet data")
+
+		diceData := strings.Fields(rawData)
+		if len(diceData) < 2 {
+			return
+		}
+
+		// Parse dice ID and dice value from the string data
+		diceIDStr := diceData[0]
+		diceID, err = strconv.Atoi(diceIDStr)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{"dice_id_str": diceIDStr, "error": err}).Warn("Failed to parse dice ID")
+			return
+		}
+
+		diceValueStr := diceData[1]
+		diceValue, err = strconv.Atoi(diceValueStr)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{"dice_value_str": diceValueStr, "error": err}).Warn("Failed to parse dice value")
+			return
+		}
 	}
 
-	diceIDStr := diceData[0]
-	diceID, err := strconv.Atoi(diceIDStr)
-	if err != nil {
-		logrus.WithFields(logrus.Fields{"dice_id_str": diceIDStr, "error": err}).Warn("Failed to parse dice ID")
-		return
+	// Adjust dice value based on client type
+	adjustedDiceValue := diceValue
+	if isFlash != nil && !*isFlash { // If it's Origins
+		adjustedDiceValue = diceValue - (diceID * 38)
 	}
 
-	diceValueStr := diceData[1]
-	diceValue, err := strconv.Atoi(diceValueStr)
-	if err != nil {
-		logrus.WithFields(logrus.Fields{"dice_value_str": diceValueStr, "error": err}).Warn("Failed to parse dice value")
-		return
-	}
-	adjustedDiceValue := diceValue - (diceID * 38)
+	// // Log the dice roll result
+	// log.Printf("Dice %d rolled: %d\n", diceID, adjustedDiceValue)
+	// logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceID, adjustedDiceValue)
+	// a.AddLogMsg(logRollResult)
 
+	// Update dice result in the dice list
 	mutex.Lock()
 	for i, dice := range diceList {
 		if dice.ID == diceID {
@@ -438,23 +552,133 @@ func (a *App) rollPokerDice() {
 	isPokerRolling = false
 }
 
-// Evaluate the poker hand and send the result to the chat
+// Roll the poker dice by sending packets and waiting for results
+func (a *App) rollPokerDiceFlash() {
+	mutex.Lock()
+
+	// Flash allows only 3 dice
+	if len(diceList) < 3 {
+		mutex.Unlock()
+		log.Println("Not enough dice to roll")
+		isPokerRolling = false
+		return
+	}
+
+	resultsWaitGroup.Add(3) // Add the total number of rolls to the wait group
+	mutex.Unlock()
+
+	// Flash version: Roll 3 dice first
+	flashDiceResults := make([]int, 5)
+
+	// Ensure it is reset (just to be explicit)
+	for i := range flashDiceResults {
+		flashDiceResults[i] = 0
+	}
+
+	for _, dice := range diceList {
+		dice.Roll()
+		// random delay between 550 and 600ms
+		time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
+		// log.Printf("debug 1 = %v", diceList[i].Value)
+		// flashDiceResults[i] = diceList[i].Value
+	}
+
+	time.Sleep(1000 * time.Millisecond)
+	resultsWaitGroup.Wait()
+	for i, _ := range diceList {
+		log.Printf("debug 1 = %v", diceList[i].Value)
+		flashDiceResults[i] = diceList[i].Value
+	}
+
+	// Debug output to confirm stored values
+	log.Printf("First 3 dice results: %v\n", flashDiceResults[:3])
+
+	// Short delay before re-rolling the first two dice
+	time.Sleep(500 * time.Millisecond)
+	time.Sleep(rollDelay + time.Duration(rand.Intn(250))*time.Millisecond)
+
+	mutex.Lock()
+	resultsWaitGroup.Add(2) // Add the additional dice to wait group
+	mutex.Unlock()
+
+	// Only re-roll for dice at index 0 and 1 (for indices 3 and 4)
+	for _, index := range []int{0, 1} {
+		diceList[index].Roll()
+		time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
+		// flashDiceResults[3+index] = diceList[index].Value // Correctly update the 4th and 5th elements
+	}
+
+	time.Sleep(1000 * time.Millisecond)
+	resultsWaitGroup.Wait()
+	time.Sleep(rollDelay + time.Duration(rand.Intn(250))*time.Millisecond)
+	// After waiting for the re-roll, update the second part of the results
+	for i, index := range []int{0, 1} {
+		log.Printf("debug 2 = %v", diceList[index].Value) // Log the value
+		flashDiceResults[3+i] = diceList[index].Value     // Correctly update the 4th and 5th elements
+	}
+	// for id, _ := range []int{0, 1} {
+	// 	for i := 3; i < 5; i++ {
+	// 		log.Printf("debug 2 = %v", diceList[id].Value)
+	// 		flashDiceResults[i] = diceList[id].Value
+	// 	}
+	// }
+
+	// Debug output to confirm stored values
+	log.Printf("Final Flash Dice Results: %v\n", flashDiceResults)
+
+	// for i := 0; i < 2; i++ {
+	// 	resultsWaitGroup.Add(1) // Add the total number of rolls to the wait group
+	// 	diceList[i].Roll()
+	// 	flashDiceResults[3+i] = diceList[i].Value
+	// 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
+	// 	resultsWaitGroup.Done() // Mark the roll as complete
+	// }
+
+	// Debug output to confirm stored values
+	log.Printf("Final Flash Dice Results: %v\n", flashDiceResults)
+
+	// Use the stored values for evaluation
+	a.evaluatePokerHandFlash(flashDiceResults)
+
+	isPokerRolling = false
+}
+
 func (a *App) rollTriDice() {
 	mutex.Lock()
 
-	if len(diceList) < 5 {
-		mutex.Unlock()
-		log.Println("Not enough dice to roll")
-		isTriRolling = false
-		return
+	if !*isFlash {
+		// Origins allows up to 5 dice
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			isTriRolling = false
+			return
+		}
+	} else {
+		// Flash allows only 3 dice
+		if len(diceList) < 3 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			isTriRolling = false
+			return
+		}
 	}
 
 	resultsWaitGroup.Add(3)
 	mutex.Unlock()
 
-	for _, index := range []int{0, 2, 4} {
-		diceList[index].Roll()
-		time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
+	if !*isFlash {
+		// Origins allows up to 5 dice, roll in triangle formation.
+		for _, index := range []int{0, 2, 4} {
+			diceList[index].Roll()
+			time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
+		}
+	} else {
+		// Flash only allows up to 3 dice, roll in ascending order.
+		for _, index := range []int{0, 1, 2} {
+			diceList[index].Roll()
+			time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
+		}
 	}
 
 	time.Sleep(1000 * time.Millisecond)
@@ -464,22 +688,35 @@ func (a *App) rollTriDice() {
 	isTriRolling = false
 }
 
+var nextDiceIndex int // Circular Rolling Counter
+
 // Roll dice for blackjack-style game
 func (a *App) rollBjDice() {
 	go a.closeAllDice()
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	mutex.Lock()
 
-	if len(diceList) < 5 {
-		mutex.Unlock()
-		log.Println("Not enough dice to roll")
-		isBJRolling = false
-		return
+	if isFlash != nil && *isFlash {
+		if len(diceList) < 3 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll for Flash")
+			isBJRolling = false
+			return
+		}
+	} else {
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll for Origins")
+			isBJRolling = false
+			return
+		}
 	}
 
 	currentSum = 0 // Reset sum before starting
 	resultsWaitGroup.Add(3)
 	mutex.Unlock()
+
+	nextDiceIndex = 0 // Reset state
 
 	// Roll the first three dice in order
 	for _, index := range []int{0, 1, 2} {
@@ -503,9 +740,19 @@ func (a *App) rollBjDice() {
 func (a *App) hitBjDice() {
 	mutex.Lock()
 
-	if len(diceList) < 5 {
+	maxDice := 5 // Default to Origins (5 dice)
+	if isFlash != nil && *isFlash {
+		maxDice = 3 // Flash has only 3 dice
+	}
+
+	if len(diceList) < maxDice {
 		mutex.Unlock()
-		log.Println("Not enough dice to roll")
+		log.Printf("Not enough dice to hit for %s\n", func() string {
+			if maxDice == 3 {
+				return "Flash"
+			}
+			return "Origins"
+		}())
 		isBJRolling = false
 		isHitting = false
 		return
@@ -514,43 +761,41 @@ func (a *App) hitBjDice() {
 	resultsWaitGroup.Add(1)
 	mutex.Unlock()
 
-	for i := 3; i < 5; i++ { // Start from index 3 to roll the next available dice
+	// Try rolling the next available unrolled dice
+	for i := 3; i < maxDice; i++ {
 		if diceList[i].Value == 0 {
 			diceList[i].Roll()
 			time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 			resultsWaitGroup.Wait()
 
 			mutex.Lock()
-			currentSum += diceList[i].Value // Add value to current sum
+			currentSum += diceList[i].Value
 			mutex.Unlock()
 
-			// Re-evaluate the hand after hitting
 			a.evaluateBlackjackHand()
-
 			isBJRolling = false
 			isHitting = false
 			return
 		}
 	}
 
-	// If all dice have been rolled, re-roll the last one
-	oldValue := diceList[4].Value
-	// sleep random between 1000 and 1500ms
+	// If all dice have been rolled, start re-rolling the oldest one
+	oldValue := diceList[nextDiceIndex%maxDice].Value
 	time.Sleep(time.Duration(rand.Intn(1000)+500) * time.Millisecond)
-	diceList[4].Roll()
+	diceList[nextDiceIndex%maxDice].Roll()
 
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	resultsWaitGroup.Wait()
-	newValue := diceList[4].Value
+	newValue := diceList[nextDiceIndex%maxDice].Value
 
 	mutex.Lock()
-	currentSum = currentSum + newValue // Adjust current sum
+	currentSum = currentSum + newValue
 	mutex.Unlock()
 
-	// Log the value of the dice rolled
-	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[4].ID, newValue, oldValue)
+	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[nextDiceIndex%maxDice].ID, newValue, oldValue)
 
-	// Re-evaluate the hand with the updated sum
+	nextDiceIndex = (nextDiceIndex + 1) % maxDice
+
 	a.evaluateBlackjackHand()
 
 	isHitting = false
@@ -563,18 +808,29 @@ func (a *App) roll13Dice() {
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	mutex.Lock()
 
-	if len(diceList) < 5 {
-		mutex.Unlock()
-		log.Println("Not enough dice to roll")
-		is13Rolling = false
-		return
+	if isFlash != nil && *isFlash {
+		if len(diceList) < 3 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll for Flash")
+			is13Rolling = false
+			return
+		}
+	} else {
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll for Origins")
+			is13Rolling = false
+			return
+		}
 	}
 
 	currentSum = 0 // Reset sum before starting
 	resultsWaitGroup.Add(2)
 	mutex.Unlock()
 
-	// Roll the first three dice in order
+	nextDiceIndex = 2 // Reset state (default to 2 since we will always roll first 2 Dice in 13)
+
+	// Roll the first two dice in order
 	for _, index := range []int{0, 1} {
 		diceList[index].Roll()
 		time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
@@ -596,9 +852,19 @@ func (a *App) roll13Dice() {
 func (a *App) hit13Dice() {
 	mutex.Lock()
 
-	if len(diceList) < 5 {
+	maxDice := 5 // Default to Origins (5 dice)
+	if isFlash != nil && *isFlash {
+		maxDice = 3 // Flash has only 3 dice
+	}
+
+	if len(diceList) < maxDice {
 		mutex.Unlock()
-		log.Println("Not enough dice to roll")
+		log.Printf("Not enough dice to hit for %s\n", func() string {
+			if maxDice == 3 {
+				return "Flash"
+			}
+			return "Origins"
+		}())
 		is13Rolling = false
 		is13Hitting = false
 		return
@@ -607,7 +873,7 @@ func (a *App) hit13Dice() {
 	resultsWaitGroup.Add(1)
 	mutex.Unlock()
 
-	for i := 2; i < 5; i++ { // Start from index 2 to roll the next available dice
+	for i := 2; i < maxDice; i++ { // Start from index 2 to roll the next available dice
 		if diceList[i].Value == 0 {
 			diceList[i].Roll()
 			time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
@@ -627,21 +893,23 @@ func (a *App) hit13Dice() {
 	}
 
 	// If all dice have been rolled, re-roll the last one
-	oldValue := diceList[4].Value
+	oldValue := diceList[nextDiceIndex%maxDice].Value
 	// sleep random between 1000 and 1500ms
 	time.Sleep(time.Duration(rand.Intn(1000)+500) * time.Millisecond)
-	diceList[4].Roll()
+	diceList[nextDiceIndex%maxDice].Roll()
 
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	resultsWaitGroup.Wait()
-	newValue := diceList[4].Value
+	newValue := diceList[nextDiceIndex%maxDice].Value
 
 	mutex.Lock()
 	currentSum = currentSum + newValue // Adjust current sum
 	mutex.Unlock()
 
 	// Log the value of the dice rolled
-	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[4].ID, newValue, oldValue)
+	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[nextDiceIndex%maxDice].ID, newValue, oldValue)
+
+	nextDiceIndex = (nextDiceIndex + 1) % maxDice
 
 	// Re-evaluate the hand with the updated sum
 	a.evaluate13Hand()
@@ -654,8 +922,54 @@ func verifyResult() {
 	// Convert the currentSum to a string
 	sumStr := strconv.Itoa(currentSum)
 	mutex.Lock()
-	ext.Send(out.SHOUT, sumStr)
+	if isFlash != nil && *isFlash { // Flash (Legacy) client handling
+		ext.Send(legacyOut.Shout, sumStr)
+	} else { // Origins (Shockwave) client handling
+		ext.Send(out.SHOUT, sumStr)
+	}
 	mutex.Unlock()
+}
+
+func (a *App) HandleAction(action string) {
+	// Ensure that no action is being executed concurrently
+	if isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing {
+		log.Println("Already rolling or closing...")
+		return
+	}
+
+	// Switch case to handle different actions
+	switch action {
+	case "poker":
+		logRollResult := fmt.Sprintln("Poker Roll:")
+		a.AddLogMsg(logRollResult)
+		isPokerRolling = true
+		if isFlash != nil && !*isFlash { // If it's Origins
+			go a.rollPokerDice()
+		} else {
+			go a.rollPokerDiceFlash()
+		}
+
+	case "tri":
+		logRollResult := fmt.Sprintln("Tri Roll:")
+		a.AddLogMsg(logRollResult)
+		isTriRolling = true
+		go a.rollTriDice()
+
+	case "21":
+		logRollResult := fmt.Sprintln("21 Roll:")
+		a.AddLogMsg(logRollResult)
+		isBJRolling = true
+		go a.rollBjDice()
+
+	case "13":
+		logRollResult := fmt.Sprintln("13 Roll:")
+		a.AddLogMsg(logRollResult)
+		is13Rolling = true
+		go a.roll13Dice()
+
+	default:
+		log.Printf("Unknown action: %s", action)
+	}
 }
 
 func (a *App) ShowCommands() {
@@ -695,7 +1009,11 @@ func (a *App) ShowCommands() {
 			":commands - This help screen :)"
 
 	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-	ext.Send(in.SYSTEM_BROADCAST, commandList)
+	if isFlash != nil && *isFlash { // Flash (Legacy) client handling
+		ext.Send(legacyIn.HabboBroadcast, commandList)
+	} else { // Origins (Shockwave) client handling
+		ext.Send(in.SYSTEM_BROADCAST, commandList)
+	}
 }
 
 // QDave's Logging function for frontend

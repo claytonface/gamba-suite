@@ -11,6 +11,14 @@
 
     <button @click="handleShowCommands" class="show-commands-button save-button">Show Commands</button>
 
+     <!-- Additional Buttons -->
+     <div class="button-group">
+      <button @click="handleButtonClick('poker')" class="action-button">Poker</button>
+      <button @click="handleButtonClick('tri')" class="action-button">Tri</button>
+      <button @click="handleButtonClick('21')" class="action-button">21</button>
+      <button @click="handleButtonClick('13')" class="action-button">13</button>
+    </div>
+
     <!-- Update notice -->
     <div v-if="isOutdated" class="update-notice">
       A new version of this application is available. Please update to the latest version.
@@ -71,6 +79,16 @@ export default {
       } catch (error) {
         this.addLogMsg('Error saving configuration');
         console.error(error);
+      }
+    },
+    async handleButtonClick(action) {
+      try {
+        // console.log(`Handling action: ${action}`); // Log the action being processed
+        await window.go.main.App.HandleAction(action);
+        this.addLogMsg(`Button clicked: ${action}`);
+      } catch (error) {
+        this.addLogMsg(`Error actioning ${action}: ${error.message}`);
+        console.error(`Error actioning ${action}: `, error); // Log more detailed error
       }
     },
     addLogMsg(msg) {
@@ -195,6 +213,28 @@ input[type="text"]::placeholder {
 
 .save-button:hover {
   background-color: #1e1e1e;
+}
+
+.button-group {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 15px;
+}
+
+.action-button {
+  flex: 1;
+  margin: 0 5px;
+  padding: 10px;
+  background-color: #333;
+  color: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background-color 0.3s ease;
+}
+
+.action-button:hover {
+  background-color: #555;
 }
 
 .log-section {

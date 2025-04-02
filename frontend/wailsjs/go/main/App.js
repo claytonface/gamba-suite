@@ -10,6 +10,10 @@ export function GetCurrentVersion() {
   return window['go']['main']['App']['GetCurrentVersion']();
 }
 
+export function HandleAction(arg1) {
+  return window['go']['main']['App']['HandleAction'](arg1);
+}
+
 export function LoadConfig() {
   return window['go']['main']['App']['LoadConfig']();
 }
