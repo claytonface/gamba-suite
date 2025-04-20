@@ -13,10 +13,30 @@
 
      <!-- Additional Buttons -->
      <div class="button-group">
-      <button @click="handleButtonClick('poker')" class="action-button">Poker</button>
-      <button @click="handleButtonClick('tri')" class="action-button">Tri</button>
-      <button @click="handleButtonClick('21')" class="action-button">21</button>
-      <button @click="handleButtonClick('13')" class="action-button">13</button>
+      <button 
+        @click="handleButtonClick('poker')" 
+        class="action-button" 
+        :disabled="isButtonsDisabled"
+        :style="buttonStyle"
+      >Poker</button>
+      <button 
+        @click="handleButtonClick('tri')" 
+        class="action-button" 
+        :disabled="isButtonsDisabled"
+        :style="buttonStyle"
+      >Tri</button>
+      <button 
+        @click="handleButtonClick('21')" 
+        class="action-button" 
+        :disabled="isButtonsDisabled"
+        :style="buttonStyle"
+      >21</button>
+      <button 
+        @click="handleButtonClick('13')" 
+        class="action-button" 
+        :disabled="isButtonsDisabled"
+        :style="buttonStyle"
+      >13</button>
     </div>
 
     <!-- Update notice -->
@@ -47,12 +67,22 @@ export default {
         nothing: '',
       },
       log: [],
-      isOutdated: false, // Add this line to initialize isOutdated
-      currentVersion: "", // Will be fetched from backend
+      isOutdated: false,
+      currentVersion: "",
+      isButtonsDisabled: false,
+      animationProgress: 0,
     };
   },
+  computed: {
+    buttonStyle() {
+      if (!this.isButtonsDisabled) return {};
+      return {
+        background: `linear-gradient(to right, #222 0%, #222 ${this.animationProgress}%, #333 ${this.animationProgress}%, #333 100%)`,
+      };
+    },
+  },
   methods: {
-     async handleShowCommands() {
+    async handleShowCommands() {
       try {
         await window.go.main.App.ShowCommands();
       } catch (error) {
@@ -82,14 +112,34 @@ export default {
       }
     },
     async handleButtonClick(action) {
+      if (this.isButtonsDisabled) return;
+      
       try {
-        // console.log(`Handling action: ${action}`); // Log the action being processed
+        this.isButtonsDisabled = true;
+        this.animateButtonProgress();
         await window.go.main.App.HandleAction(action);
-        this.addLogMsg(`Button clicked: ${action}`);
       } catch (error) {
         this.addLogMsg(`Error actioning ${action}: ${error.message}`);
-        console.error(`Error actioning ${action}: `, error); // Log more detailed error
+        console.error(`Error actioning ${action}: `, error);
       }
+    },
+    animateButtonProgress() {
+      const duration = 3500; // 3.5 seconds
+      const startTime = Date.now();
+      
+      const updateProgress = () => {
+        const elapsed = Date.now() - startTime;
+        this.animationProgress = Math.min((elapsed / duration) * 100, 100);
+        
+        if (elapsed < duration) {
+          requestAnimationFrame(updateProgress);
+        } else {
+          this.isButtonsDisabled = false;
+          this.animationProgress = 0;
+        }
+      };
+      
+      requestAnimationFrame(updateProgress);
     },
     addLogMsg(msg) {
       this.log.push(msg);
@@ -125,7 +175,7 @@ export default {
     },
     async fetchCurrentVersion() {
       try {
-        const version = await window.go.main.App.GetCurrentVersion(); // Fetch version from Go
+        const version = await window.go.main.App.GetCurrentVersion();
         this.currentVersion = version;
       } catch (error) {
         this.addLogMsg('Error fetching current version');
@@ -147,7 +197,6 @@ export default {
   }
 };
 </script>
-
 
 <style scoped>
 body {
@@ -233,30 +282,33 @@ input[type="text"]::placeholder {
   transition: background-color 0.3s ease;
 }
 
-.action-button:hover {
+.action-button:hover:not(:disabled) {
   background-color: #555;
 }
 
+.action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
 .log-section {
-  background-color: #000000; /* Black background for the console */
+  background-color: #000000;
   padding: 10px;
   border-radius: 4px;
   height: 200px;
   overflow-y: auto;
   font-family: monospace;
   margin-top: 10px;
-  color: #00ff00; /* Green text color for the hacker console style */
+  color: #00ff00;
   font-size: 13px;
   line-height: 1.4em;
-  border: 2px solid #00ff00; /* Optional: Green border for console look */
+  border: 2px solid #00ff00;
 }
 
-/* Add some padding to each log message for readability */
 .log-section div {
   padding: 2px 0;
 }
 
-/* Update notice style */
 .update-notice {
   margin-top: 15px;
   padding: 10px;

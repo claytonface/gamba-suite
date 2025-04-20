@@ -77,15 +77,8 @@ func setupExt() {
 		clientIdentifier := e.Client.Identifier
 		flashDetected := strings.Contains(strings.ToUpper(clientIdentifier), "FLASH")
 		isFlash = &flashDetected // Set the global flag
-		log.Printf("Is Flash: %v", *isFlash)
+		log.Printf("Switching to Flash Version: %v", *isFlash)
 	})
-
-	// ext.Connected(func(e g.ConnectArgs) {
-	// 	log.Printf("connected (%s:%d)", e.Host, e.Port)
-	// 	log.Printf("client %s (%s)", e.Client.Identifier, e.Client.Version)
-	// 	clientIdentifier := e.Client.Identifier
-	// 	isFlash = strings.Contains(strings.ToUpper(clientIdentifier), "FLASH")
-	// })
 
 	ext.Disconnected(func() {
 		log.Printf("connection lost")

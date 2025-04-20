@@ -139,7 +139,7 @@ func getConfigFilePath() string {
 func (a *App) setupExt() {
 	go func() { // Run in a separate goroutine
 		for isFlash == nil { // Wait until isFlash is set
-			time.Sleep(100 * time.Millisecond) // Small delay to prevent CPU overuse
+			time.Sleep(100 * time.Millisecond)
 		}
 		if isFlash != nil && !*isFlash {
 			log.Printf("Detected Origins: %v", *isFlash)
@@ -481,11 +481,6 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 		adjustedDiceValue = diceValue - (diceID * 38)
 	}
 
-	// // Log the dice roll result
-	// log.Printf("Dice %d rolled: %d\n", diceID, adjustedDiceValue)
-	// logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceID, adjustedDiceValue)
-	// a.AddLogMsg(logRollResult)
-
 	// Update dice result in the dice list
 	mutex.Lock()
 	for i, dice := range diceList {
@@ -579,19 +574,14 @@ func (a *App) rollPokerDiceFlash() {
 		dice.Roll()
 		// random delay between 550 and 600ms
 		time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
-		// log.Printf("debug 1 = %v", diceList[i].Value)
-		// flashDiceResults[i] = diceList[i].Value
 	}
 
 	time.Sleep(1000 * time.Millisecond)
 	resultsWaitGroup.Wait()
 	for i, _ := range diceList {
-		log.Printf("debug 1 = %v", diceList[i].Value)
+		// log.Printf("debug 1 = %v", diceList[i].Value)
 		flashDiceResults[i] = diceList[i].Value
 	}
-
-	// Debug output to confirm stored values
-	log.Printf("First 3 dice results: %v\n", flashDiceResults[:3])
 
 	// Short delay before re-rolling the first two dice
 	time.Sleep(500 * time.Millisecond)
@@ -605,7 +595,6 @@ func (a *App) rollPokerDiceFlash() {
 	for _, index := range []int{0, 1} {
 		diceList[index].Roll()
 		time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
-		// flashDiceResults[3+index] = diceList[index].Value // Correctly update the 4th and 5th elements
 	}
 
 	time.Sleep(1000 * time.Millisecond)
@@ -616,26 +605,6 @@ func (a *App) rollPokerDiceFlash() {
 		log.Printf("debug 2 = %v", diceList[index].Value) // Log the value
 		flashDiceResults[3+i] = diceList[index].Value     // Correctly update the 4th and 5th elements
 	}
-	// for id, _ := range []int{0, 1} {
-	// 	for i := 3; i < 5; i++ {
-	// 		log.Printf("debug 2 = %v", diceList[id].Value)
-	// 		flashDiceResults[i] = diceList[id].Value
-	// 	}
-	// }
-
-	// Debug output to confirm stored values
-	log.Printf("Final Flash Dice Results: %v\n", flashDiceResults)
-
-	// for i := 0; i < 2; i++ {
-	// 	resultsWaitGroup.Add(1) // Add the total number of rolls to the wait group
-	// 	diceList[i].Roll()
-	// 	flashDiceResults[3+i] = diceList[i].Value
-	// 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
-	// 	resultsWaitGroup.Done() // Mark the roll as complete
-	// }
-
-	// Debug output to confirm stored values
-	log.Printf("Final Flash Dice Results: %v\n", flashDiceResults)
 
 	// Use the stored values for evaluation
 	a.evaluatePokerHandFlash(flashDiceResults)
@@ -646,19 +615,17 @@ func (a *App) rollPokerDiceFlash() {
 func (a *App) rollTriDice() {
 	mutex.Lock()
 
-	if !*isFlash {
-		// Origins allows up to 5 dice
-		if len(diceList) < 5 {
+	if isFlash != nil && *isFlash {
+		if len(diceList) < 3 {
 			mutex.Unlock()
-			log.Println("Not enough dice to roll")
+			log.Println("Not enough dice to roll for Flash")
 			isTriRolling = false
 			return
 		}
 	} else {
-		// Flash allows only 3 dice
-		if len(diceList) < 3 {
+		if len(diceList) < 5 {
 			mutex.Unlock()
-			log.Println("Not enough dice to roll")
+			log.Println("Not enough dice to roll for Origins")
 			isTriRolling = false
 			return
 		}
@@ -931,12 +898,6 @@ func verifyResult() {
 }
 
 func (a *App) HandleAction(action string) {
-	// Ensure that no action is being executed concurrently
-	if isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing {
-		log.Println("Already rolling or closing...")
-		return
-	}
-
 	// Switch case to handle different actions
 	switch action {
 	case "poker":

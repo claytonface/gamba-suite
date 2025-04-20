@@ -23,17 +23,16 @@ func (d *Dice) Roll() error {
 		return errors.New("no dice id")
 	}
 
-	// ext.Send(out.THROW_DICE, []byte(fmt.Sprintf("%d", d.ID)))
 	// Check if using Flash (Legacy) or Shockwave (Origins)
 	if isFlash != nil && *isFlash {
 		// Flash (Legacy) uses raw binary data (4 bytes for the dice ID)
-		// Convert diceID to a 4-byte slice (BigEndian) and send it
 		diceIDBytes := make([]byte, 4)
+		// Convert diceID to a 4-byte slice (BigEndian) and send it
 		binary.BigEndian.PutUint32(diceIDBytes, uint32(d.ID))
-
 		ext.Send(legacyOut.ThrowDice, diceIDBytes)
 	} else {
 		// Shockwave (Origins) sends the dice ID as a string (or simple number)
+		// Send the throw dice packet
 		ext.Send(out.THROW_DICE, []byte(fmt.Sprintf("%d", d.ID)))
 	}
 	d.IsRolling = true
@@ -50,19 +49,14 @@ func (d *Dice) Close() error {
 	// Check if using Flash (Legacy) or Shockwave (Origins)
 	if isFlash != nil && *isFlash {
 		// Flash (Legacy) uses raw binary data (4 bytes for the dice ID)
-		// Convert diceID to a 4-byte slice (BigEndian) and send it
 		diceIDBytes := make([]byte, 4)
+		// Convert diceID to a 4-byte slice (BigEndian) and send it
 		binary.BigEndian.PutUint32(diceIDBytes, uint32(d.ID))
-
 		ext.Send(legacyOut.DiceOff, diceIDBytes)
 	} else {
-		// Shockwave (Origins) sends the dice ID as a string (or simple number)
 		// Send the dice off packet
 		ext.Send(out.DICE_OFF, []byte(fmt.Sprintf("%d", d.ID)))
 	}
-
-	// // Send the throw dice packet
-	// ext.Send(out.DICE_OFF, []byte(fmt.Sprintf("%d", d.ID)))
 	d.IsClosed = true
 	return nil
 }
