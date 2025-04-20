@@ -5,6 +5,8 @@ Gamba Suite is a powerful tool for managing, rolling, and resetting dice with au
 ## Features
 
 - **Graphical User Interface (GUI):** Easily manage your dice games with a user-friendly interface that displays your dice, roll history, and game options.
+- **Multi-Hotel Support:** Seamlessly works across multiple Habbo platforms, automatically detecting and supporting both Origins and Flash clients.
+- **Cross-Platform Compatibility:** Fully functional on both Windows and Mac operating systems.
 - **Manage multiple dice:** Handle operations involving multiple dice, including adding, removing, and tracking their states.
 - **Roll and reset dice:** Simulate rolling dice and resetting them to their initial state.
 - **Automatically evaluate poker hands:** Determine the value of poker hands based on the rolled dice.
