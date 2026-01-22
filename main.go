@@ -89,8 +89,8 @@ func (a *App) LoadConfig() *PokerDisplayConfig {
 			HighStraight: "High Str8",
 			LowStraight:  "Low Str8",
 			ThreeOfAKind: "Three of a kind: %s",
-			TwoPair:      "Two Pair: %s",
-			OnePair:      "One Pair: %s",
+			TwoPair:      "Two Pair: %ss",
+			OnePair:      "One Pair: %ss",
 			Nothing:      "Nothing",
 		}
 	}
@@ -434,7 +434,8 @@ func (a *App) rollPokerDice() {
 
 	time.Sleep(1000 * time.Millisecond)
 	resultsWaitGroup.Wait()
-	a.evaluatePokerRound()
+	a.evaluatePokerHand()
+	isPokerRolling = false
 }
 
 // Evaluate the poker hand and send the result to the chat
