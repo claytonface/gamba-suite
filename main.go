@@ -39,7 +39,50 @@ var (
 	mutex            sync.Mutex
 	resultsWaitGroup sync.WaitGroup
 	rollDelay        = 550 * time.Millisecond
+		// Trade capture (one trade at a time)
+	tradeOpen       bool
+	tradePartner    string
+	tradeItemClass  string
+	tradeBetCount   int
+
+	// Inventory cache built from STRIPINFO_2 after GETSTRIP new
+	invCounts       = map[string]int{}
+	invCollecting   bool
+	invReady		bool
 )
+var (
+	lastStripInfoAt time.Time
+)
+
+var tradeCanAutoAccept bool
+var tradeNeeded int
+var dealerAddedInTrade int
+var autoTradeAccept = true
+var tradeAcceptedByBot bool
+
+// ---- Session (Step 1) ----
+// One session at a time. Trades will hook into this later.
+type Session struct {
+	Active     bool
+	PlayerName string
+
+	// What item the player bet (e.g. "duck") and how many were bet for the CURRENT round
+	ItemClass string
+	BetCount  int
+
+	// Bankroll tracked AFTER a win (e.g. bet 1 duck => Balance becomes 2)
+	Balance int
+
+	// State flags
+	AwaitingGameChoice bool
+	InGame             bool
+
+	// Post-win options
+	CanRisk    bool
+	CanCashOut bool
+}
+
+var session Session
 
 type App struct {
 	ext    *g.Ext
@@ -74,6 +117,16 @@ func (a *App) startup(ctx context.Context) {
 	go func() {
 		a.runExt()
 	}()
+	// Warm inventory continuously so first trade has real counts
+	go func() {
+		time.Sleep(2 * time.Second)
+		for {
+			a.refreshInventoryAndWait(3 * time.Second)
+			time.Sleep(8 * time.Second)
+		}
+	}()
+
+
 }
 
 func (a *App) LoadConfig() *PokerDisplayConfig {
@@ -89,8 +142,8 @@ func (a *App) LoadConfig() *PokerDisplayConfig {
 			HighStraight: "High Str8",
 			LowStraight:  "Low Str8",
 			ThreeOfAKind: "Three of a kind: %s",
-			TwoPair:      "Two Pair: %ss",
-			OnePair:      "One Pair: %ss",
+			TwoPair:      "Two Pair: %s",
+			OnePair:      "One Pair: %s",
 			Nothing:      "Nothing",
 		}
 	}
@@ -126,7 +179,7 @@ func (a *App) SaveConfig(config *PokerDisplayConfig) {
 
 func getConfigFilePath() string {
 	configDir, _ := os.UserConfigDir()
-	configPath := filepath.Join(configDir, "Gamba-Suite")
+	configPath := filepath.Join(configDir, "URTBOT")
 	os.MkdirAll(configPath, 0700)
 	return filepath.Join(configPath, "poker_display_config.json")
 }
@@ -139,8 +192,15 @@ func (a *App) setupExt() {
 	a.ext.Intercept(out.CHAT).With(a.handleTalk)
 	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
 	a.ext.InterceptAll(func(e *g.Intercept) {
-		handleMutePacket(e)
+	handleMutePacket(e)     // existing
+	a.handleTradeAndInv(e)  // new Step 2
+})
+	// Register missing identifiers (Shockwave)
+	a.ext.Initialized(func(args g.InitArgs) {
+		// Outgoing[402] -> TRADE_CONFIRM_ACCEPT
+		a.ext.Headers().Add("TRADE_CONFIRM_ACCEPT", g.Header{Dir: g.Out, Value: 402})
 	})
+
 }
 
 func (a *App) runExt() {
@@ -208,10 +268,50 @@ func (a *App) onChatMessage(e *g.Intercept) {
 
 		command := strings.TrimPrefix(msg, ":")
 		switch {
+					case strings.HasPrefix(command, "session "):
+			// Manual test command (Step 1):
+			// :session <playerName> <itemClass> <betCount>
+			// Example: :session bob duck 1
+			e.Block()
+
+			parts := strings.Fields(command) // ["session","bob","duck","1"]
+			if len(parts) != 4 {
+				a.AddLogMsg("Usage: :session <playerName> <itemClass> <betCount>")
+				return
+			}
+
+			playerName := parts[1]
+			itemClass := parts[2]
+			n, err := strconv.Atoi(parts[3])
+			if err != nil || n <= 0 {
+				a.AddLogMsg("Session error: betCount must be a positive number.")
+				return
+			}
+
+			// Don’t allow overriding an active session
+			if sessionActive() {
+				a.AddLogMsg("Session already active. Use :endsession first.")
+				return
+			}
+
+			startSession(playerName, itemClass, n)
+			a.AddLogMsg(fmt.Sprintf("Session started for %s: %dx %s. Awaiting game choice (:pkr, :tri, :21, :13)",
+				playerName, n, itemClass))
+
+		case strings.HasSuffix(command, "endsession"):
+			e.Block()
+			if !sessionActive() {
+				a.AddLogMsg("No active session to end.")
+				return
+			}
+			endSession()
+			a.AddLogMsg("Session ended.")
+
 		case strings.HasSuffix(command, "reset"):
 			e.Block()
 			resetDiceState()
-		case strings.HasSuffix(command, "roll"):
+		case strings.HasSuffix(command, "roll") || strings.HasSuffix(command, "pkr"):
+
 			e.Block()
 			isPokerRolling = true
 			logRollResult := fmt.Sprintf("Poker Roll:\n")
@@ -265,6 +365,91 @@ func (a *App) evalAt(msg string) {
 	a.AddLogMsg(at)
 	mutex.Unlock()
 }
+func startSession(playerName, itemClass string, betCount int) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	session = Session{
+		Active:             true,
+		PlayerName:         playerName,
+		ItemClass:          itemClass,
+		BetCount:           betCount,
+		Balance:            0,
+		AwaitingGameChoice: true,
+		InGame:             false,
+		CanRisk:            false,
+		CanCashOut:         false,
+	}
+}
+
+func endSession() {
+	mutex.Lock()
+	defer mutex.Unlock()
+	session = Session{}
+}
+
+func sessionActive() bool {
+	mutex.Lock()
+	defer mutex.Unlock()
+	return session.Active
+}
+func countStripInstances(rawStr string, itemClass string) int {
+	// Count how many item instance IDs are in this STRIPINFO_2 line.
+	// In your payload, IDs look like: MjGl|MjGn|MjGHS ... HHduck
+	// So count pipes BEFORE the "HH<item>" marker.
+
+	marker := "HH" + itemClass
+	idx := strings.Index(rawStr, marker)
+	if idx == -1 {
+		// fallback: count all pipes if marker not found
+		p := strings.Count(rawStr, "|")
+		if p <= 0 {
+			return 1
+		}
+		return p + 1
+	}
+
+	prefix := rawStr[:idx]
+	p := strings.Count(prefix, "|")
+	if p <= 0 {
+		return 1
+	}
+	return p + 1
+}
+
+
+
+func (a *App) refreshInventoryAndWait(timeout time.Duration) {
+	// Don’t wipe invCounts here — it causes “0” windows.
+	// Only GETSTRIP "new" should clear the map.
+	invCollecting = true
+	invReady = false
+	lastStripInfoAt = time.Time{}
+
+	// Ask server for fresh inventory
+	a.ext.Send(out.GETSTRIP, []byte("AAnew"))
+
+	end := time.Now().Add(timeout)
+
+	// Wait until we’ve received at least one inventory packet
+	for time.Now().Before(end) {
+		time.Sleep(50 * time.Millisecond)
+
+		if invReady {
+			// Once ready, wait for packets to go quiet (inventory burst finished)
+			if !lastStripInfoAt.IsZero() && time.Since(lastStripInfoAt) > 500*time.Millisecond {
+				break
+			}
+		}
+	}
+
+	// IMPORTANT: do NOT set invCollecting=false here.
+	// We want to keep accepting STRIPINFO_2 updates continuously.
+}
+
+
+
+
 
 // Reset all saved dice states
 func resetDiceState() {
@@ -393,6 +578,402 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 	}
 	mutex.Unlock()
 }
+// Splits packet raw bytes into human-ish tokens (Shockwave uses control separators like 0x02 and 0x7f)
+func splitTokens(raw []byte) []string {
+	s := string(raw)
+
+	// Replace common separators with spaces
+	replacer := strings.NewReplacer(
+		"\x02", " ",
+		"\x7f", " ",
+		"\x00", " ",
+		"\n", " ",
+		"\r", " ",
+		"\t", " ",
+	)
+	s = replacer.Replace(s)
+
+	parts := strings.Fields(s)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+
+func countInstancesBeforeHH(rawStr string, itemClass string) int {
+	// Example: "...MjGl|MjGn|MjGo|MjGHS[2]i\\wBHHduck..."
+	// Count pipes BEFORE "HHduck" marker in THIS packet.
+	marker := "HH" + itemClass
+	idx := strings.Index(rawStr, marker)
+	if idx == -1 {
+		// fallback: pipes in entire string
+		p := strings.Count(rawStr, "|")
+		if p <= 0 {
+			return 1
+		}
+		return p + 1
+	}
+
+	prefix := rawStr[:idx]
+	p := strings.Count(prefix, "|")
+	if p <= 0 {
+		return 1
+	}
+	return p + 1
+}
+
+
+func extractLowerWord(s string) string {
+	// Find the last contiguous run of lowercase letters (e.g. "duck")
+	last := ""
+	cur := strings.Builder{}
+
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' {
+			cur.WriteRune(r)
+		} else {
+			if cur.Len() >= 2 {
+				last = cur.String()
+			}
+			cur.Reset()
+		}
+	}
+	if cur.Len() >= 2 {
+		last = cur.String()
+	}
+
+	// Normalize common Shockwave prefixes:
+	// Trade tokens often contain "lduck" where the real class is "duck"
+	if strings.HasPrefix(last, "l") && len(last) >= 3 {
+		last = last[1:]
+	}
+
+	// Filter obvious junk that shows up in trade packets
+	switch last {
+	case "al", "ot", "other", "null", "trd":
+		return ""
+	}
+
+	return last
+}
+
+func itemClassFromHH(raw string) string {
+	// STRIPINFO_2 contains "...HHduck[2]..."
+	idx := strings.Index(raw, "HH")
+	if idx == -1 || idx+2 >= len(raw) {
+		return ""
+	}
+
+	i := idx + 2
+	j := i
+	for j < len(raw) {
+		c := raw[j]
+		if c >= 'a' && c <= 'z' {
+			j++
+			continue
+		}
+		break
+	}
+
+	if j <= i {
+		return ""
+	}
+
+	return raw[i:j]
+}
+
+func extractItemClassAndCount(tokens []string) (itemClass string, count int) {
+	// Pull lowercase word candidates out of all tokens, then choose
+	// the most frequent candidate (that’s usually the traded item).
+	counts := map[string]int{}
+	for _, t := range tokens {
+		w := extractLowerWord(t)
+		if w == "" {
+			continue
+		}
+		counts[w]++
+	}
+
+	// pick best candidate: highest frequency, tie-breaker: longer word
+	best := ""
+	bestCount := 0
+	for w, c := range counts {
+		if c > bestCount || (c == bestCount && len(w) > len(best)) {
+			best = w
+			bestCount = c
+		}
+	}
+	return best, bestCount
+}
+
+
+func pickPartnerCandidate(tokens []string) string {
+	// Best-effort: pick the first token that looks like a username-ish thing.
+	// This may need tuning after you see logs.
+	for _, t := range tokens {
+		// Avoid obvious non-names
+		lt := strings.ToLower(t)
+		if lt == "trd" || lt == "useradmin" || lt == "flatctrl" || lt == "null" || lt == "other" {
+			continue
+		}
+		// allow letters, digits, underscore, hyphen
+		ok := true
+		for _, r := range t {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+				continue
+			}
+			ok = false
+			break
+		}
+		if ok && len(t) >= 2 && len(t) <= 24 {
+			return t
+		}
+	}
+	return ""
+}
+
+func (a *App) resetTradeCapture() {
+	tradeOpen = false
+	tradePartner = ""
+	tradeItemClass = ""
+	tradeBetCount = 0
+}
+
+// Called from InterceptAll (Step 2)
+func (a *App) handleTradeAndInv(e *g.Intercept) {
+	h := e.Packet.Header.Value
+
+	switch h {
+		
+	case 111: // TRADE_CONFIRM (Incoming) -> confirm screen shown
+	if !tradeOpen {
+		return
+	}
+	if !tradeAcceptedByBot {
+		return
+	}
+	if tradeItemClass == "" || tradeBetCount <= 0 {
+		return
+	}
+
+	needed := tradeBetCount * 2
+	a.refreshInventoryAndWait(4 * time.Second)
+
+	if !invReady {
+		a.AddLogMsg("AutoConfirm skipped: inventory not ready.")
+		return
+	}
+
+	have := invCounts[tradeItemClass]
+	a.AddLogMsg(fmt.Sprintf("AutoConfirm check: have %d %s, need %d", have, tradeItemClass, needed))
+
+if have >= needed {
+	a.ext.Send(g.Out.Id("TRADE_CONFIRM_ACCEPT"))
+	a.AddLogMsg("Trade: auto-confirmed")
+}
+return
+
+
+case 109: // TRADE_ACCEPT (Incoming) -> player clicked accept
+	if !tradeOpen {
+		return
+	}
+
+	if autoTradeAccept && !tradeAcceptedByBot && tradeCanAutoAccept {
+		a.ext.Send(out.TRADE_ACCEPT, []byte{})
+		tradeAcceptedByBot = true
+		a.AddLogMsg("Trade: auto-accepted (triggered by player accept)")
+	}
+	return
+
+
+
+	case 72: // TRADE_ADDITEM (Outgoing) -> dealer is adding items
+		if tradeOpen {
+			dealerAddedInTrade++
+		}
+	return
+
+	// ---- Inventory capture ----
+	case 65: // GETSTRIP (Outgoing)
+		// When client requests new inventory, reset and start collecting
+		raw := string(e.Packet.Data)
+		if strings.Contains(raw, "new") {
+	// Only clear if we’re not already in a fresh cycle
+	invCounts = map[string]int{}
+	invReady = false
+	invCollecting = true
+	a.AddLogMsg("Inventory: collecting (GETSTRIP new)")
+}
+
+		return
+
+	case 140: // STRIPINFO_2 (Incoming)
+	rawStr := string(e.Packet.Data)
+
+	item := itemClassFromHH(rawStr)
+	if item == "" {
+		return
+	}
+
+	// This packet contains a full list for that item, so set it (don’t +=)
+	invCounts[item] = countInstancesBeforeHH(rawStr, item)
+
+	invReady = true
+	lastStripInfoAt = time.Now()
+	return
+
+
+	case 98: // STRIPINFO (Incoming)
+	rawStr := string(e.Packet.Data)
+
+	item := itemClassFromHH(rawStr)
+	if item == "" {
+		return
+	}
+
+	invCounts[item] = countInstancesBeforeHH(rawStr, item)
+
+	invReady = true
+	lastStripInfoAt = time.Now()
+	return
+
+
+
+
+	case 108: // TRADE_ITEMS (Incoming)
+	if !tradeOpen {
+		return
+	}
+
+	tokens := splitTokens(e.Packet.Data)
+
+	item, total := extractItemClassAndCount(tokens)
+	if item == "" || total <= 0 {
+		return
+	}
+
+	// Subtract what the dealer added in this trade
+	bet := total - dealerAddedInTrade
+	if bet < 0 {
+		bet = 0
+	}
+
+	tradeItemClass = item
+	tradeBetCount = bet
+
+	a.AddLogMsg(fmt.Sprintf("Trade: items seen => %dx %s (total=%d dealerAdded=%d)",
+		tradeBetCount, tradeItemClass, total, dealerAddedInTrade))
+
+	// Auto-accept only if we can cover payout (never accept if we can't pay)
+	needed := tradeBetCount * 2
+a.refreshInventoryAndWait(2 * time.Second)
+have := invCounts[tradeItemClass]
+a.AddLogMsg(fmt.Sprintf("DEBUG INVENTORY: %s = %d", tradeItemClass, have))
+a.AddLogMsg(fmt.Sprintf("AutoAccept readiness: have %d %s, need %d", have, tradeItemClass, needed))
+
+tradeCanAutoAccept = (have >= needed && tradeBetCount > 0 && tradeItemClass != "")
+
+return
+
+
+
+
+
+	case 104: // TRADE_OPEN (Incoming)
+		tradeCanAutoAccept = false
+		tradeNeeded = 0
+		dealerAddedInTrade = 0
+		tradeOpen = true
+		tradeAcceptedByBot = false
+		tradeItemClass = ""
+		tradeBetCount = 0
+		tradePartner = pickPartnerCandidate(splitTokens(e.Packet.Data))
+		a.AddLogMsg("Trade: opened")
+	return
+
+
+
+	case 112: // TRADE_COMPLETED (Incoming)
+		if !tradeOpen {
+			return
+		}
+
+		// End trade capture state
+		tradeOpen = false
+
+		// Don't start if session already active
+		if sessionActive() {
+			a.AddLogMsg("Trade: completed but session already active (ignored)")
+			a.resetTradeCapture()
+			return
+		}
+
+		// Need item + count at minimum
+		if tradeItemClass == "" || tradeBetCount <= 0 {
+			a.AddLogMsg("Trade: completed but could not detect item/bet (ignored)")
+			a.resetTradeCapture()
+			return
+		}
+
+		// Partner name is best-effort; if empty, we still start but mark unknown
+		playerName := tradePartner
+		if strings.TrimSpace(playerName) == "" {
+			playerName = "UNKNOWN_PLAYER"
+		}
+
+needed := tradeBetCount * 2
+
+a.refreshInventoryAndWait(4 * time.Second)
+
+have := invCounts[tradeItemClass]
+a.AddLogMsg(fmt.Sprintf("Payout check: have %d %s, need %d", have, tradeItemClass, needed))
+
+// If inventory never updated, don't trust have=0
+	if !invReady {
+    a.AddLogMsg("Payout check failed: inventory not ready yet (no STRIPINFO_2 received). Denying bet.")
+	a.logAndMaybeShout("Session denied", "Inventory not ready. Please retry trade.")
+	a.resetTradeCapture()
+	return
+}
+
+if have < needed {
+	a.AddLogMsg(fmt.Sprintf("Session denied: need %d %s to cover payout, have %d", needed, tradeItemClass, have))
+	a.logAndMaybeShout("Session denied", fmt.Sprintf("Can't cover payout for %s (%d needed).", tradeItemClass, needed))
+	a.resetTradeCapture()
+	return
+}
+
+
+		// Start session
+		startSession(playerName, tradeItemClass, tradeBetCount)
+
+		a.AddLogMsg(fmt.Sprintf("Session started via trade: %s bet %dx %s", playerName, tradeBetCount, tradeItemClass))
+		a.logAndMaybeShout(
+			"Session started",
+			fmt.Sprintf("%s bet %d %s. Choose game: :pkr, :tri, :21, :13", playerName, tradeBetCount, tradeItemClass),
+		)
+
+		a.resetTradeCapture()
+		return
+
+	case 110: // TRADE_CLOSE (Incoming)
+		// Trade aborted/closed, clear capture
+		dealerAddedInTrade = 0
+		if tradeOpen {
+			a.AddLogMsg("Trade: closed")
+		}
+		a.resetTradeCapture()
+		tradeAcceptedByBot = false
+		return
+	}
+}
 
 // Close the dice and send the packets to the game server
 func (a *App) closeAllDice() {
@@ -422,6 +1003,9 @@ func (a *App) rollPokerDice() {
 		return
 	}
 
+	for _, dice := range diceList {
+		dice.IsRolling = false
+	}
 	resultsWaitGroup.Add(len(diceList))
 	mutex.Unlock()
 
@@ -433,9 +1017,33 @@ func (a *App) rollPokerDice() {
 	}
 
 	time.Sleep(1000 * time.Millisecond)
-	resultsWaitGroup.Wait()
-	a.evaluatePokerHand()
-	isPokerRolling = false
+	if !waitForResults(5 * time.Second) {
+		a.AddLogMsg("Poker roll timed out waiting for dice results")
+		isPokerRolling = false
+		return
+	}
+	a.evaluatePokerRound()
+}
+
+func waitForResults(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		resultsWaitGroup.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		mutex.Lock()
+		resultsWaitGroup = sync.WaitGroup{}
+		for _, dice := range diceList {
+			dice.IsRolling = false
+		}
+		mutex.Unlock()
+		return false
+	}
 }
 
 // Evaluate the poker hand and send the result to the chat
@@ -692,11 +1300,19 @@ func (a *App) ShowCommands() {
 			":@ <amount> \n" +
 			"Stores @ amount in roll log \nwith the result and will announce \nit in chat. \n" +
 			"------------------------------------\n" +
+			":session <player> <item> <count>\n" +
+			"Manual test: starts a session.\n" +
+			"------------------------------------\n" +
+			":endsession\n" +
+			"Ends the current session.\n" +
+			"------------------------------------\n" +
 			":commands - This help screen :)"
 
+	// IMPORTANT: Sleep must be a standalone statement, NOT inside the string concatenation.
 	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 	ext.Send(in.SYSTEM_BROADCAST, commandList)
 }
+
 
 // QDave's Logging function for frontend
 func (a *App) AddLogMsg(msg string) {

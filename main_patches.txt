@@ -1,0 +1,119 @@
+
+=== MAIN.GO PATCHES (copy/paste) ===
+
+1) Inventory: stop ignoring STRIPINFO packets (this is why you keep seeing 0).
+
+FIND your current STRIPINFO_2 handler (case 140). DELETE the `if !invCollecting { return }` gate (or anything that early-returns when not collecting).
+
+Then REPLACE case 140 with this (and ALSO add case 98 because sometimes the server uses STRIPINFO not STRIPINFO_2):
+
+case 98:  // STRIPINFO (Incoming) - sometimes used
+case 140: // STRIPINFO_2 (Incoming)
+    rawStr := string(e.Packet.Data)
+
+    item := itemClassFromStrip(rawStr) // NEW helper below
+    if item == "" {
+        return
+    }
+
+    // IMPORTANT: STRIPINFO packets repeat for the same class.
+    // Use '=' not '+=' or you will overcount.
+    invCounts[item] = countStripInstances(rawStr, item)
+    lastStripInfoAt = time.Now()
+    return
+
+ADD this helper anywhere in main.go (eg just above refreshInventoryAndWait):
+
+func itemClassFromStrip(rawStr string) string {
+    // Look for "HH<itemclass>" (eg "HHduck")
+    i := strings.Index(rawStr, "HH")
+    if i == -1 || i+2 >= len(rawStr) {
+        return ""
+    }
+    j := i + 2
+    for j < len(rawStr) {
+        c := rawStr[j]
+        if c < 'a' || c > 'z' {
+            break
+        }
+        j++
+    }
+    if j <= i+2 {
+        return ""
+    }
+    return rawStr[i+2 : j]
+}
+
+2) refreshInventoryAndWait: don’t stop collecting before packets arrive.
+Your current version returns too early, so STRIPINFO arrives AFTER the wait and gets ignored.
+
+REPLACE your refreshInventoryAndWait with:
+
+func (a *App) refreshInventoryAndWait(timeout time.Duration) {
+    lastStripInfoAt = time.Time{}
+
+    // ask for a full inventory rebuild
+    a.ext.Send(out.GETSTRIP, []byte("AAnew"))
+
+    deadline := time.Now().Add(timeout)
+
+    // wait until we see at least ONE STRIPINFO packet
+    for time.Now().Before(deadline) {
+        if !lastStripInfoAt.IsZero() {
+            return
+        }
+        time.Sleep(50 * time.Millisecond)
+    }
+}
+
+(Yes: simple is better. The “quiet period” logic was causing you pain.)
+
+3) Trade flow: auto-accept timing
+You said: “auto accept when the player ACCEPTS, not when items are added”.
+
+So:
+- In case 108 (TRADE_ITEMS), ONLY compute tradeBetCount/tradeItemClass and log it.
+- Move the auto-accept check into case 109 (incoming TRADE_ACCEPT from the other user):
+
+case 109: // TRADE_ACCEPT (Incoming) - other user accepted
+    if !tradeOpen || tradeAcceptedByBot {
+        return
+    }
+    if tradeItemClass == "" || tradeBetCount <= 0 {
+        return
+    }
+
+    needed := tradeBetCount * 2
+    a.refreshInventoryAndWait(8 * time.Second) // longer
+
+    if lastStripInfoAt.IsZero() {
+        a.AddLogMsg("AutoAccept skipped: inventory not ready yet (no STRIPINFO received).")
+        return
+    }
+
+    have := invCounts[tradeItemClass]
+    a.AddLogMsg(fmt.Sprintf("AutoAccept check: have %d %s, need %d", have, tradeItemClass, needed))
+
+    if have >= needed {
+        a.ext.Send(out.TRADE_ACCEPT, []byte{})
+        tradeAcceptedByBot = true
+        a.AddLogMsg("Trade: auto-accepted")
+    }
+    return
+
+4) Prevent “dealerAddedInTrade goes crazy”
+In TRADE_ITEMS, after you compute total:
+if dealerAddedInTrade > total {
+    dealerAddedInTrade = total
+}
+
+This stops negative/0 bets when your own ADDITEM counter glitches.
+
+5) UNKNOWN_PLAYER: best effort from TRADE_OPEN
+In case 104 TRADE_OPEN, add:
+
+tokens := splitTokens(e.Packet.Data)
+tradePartner = pickPartnerCandidate(tokens)
+
+If it still shows UNKNOWN_PLAYER, paste me ONE TRADE_OPEN raw line and I’ll tune pickPartnerCandidate.
+
